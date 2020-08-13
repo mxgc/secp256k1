@@ -32,17 +32,6 @@ void ECDSA_SIG_get0(const ECDSA_SIG *sig, const BIGNUM **pr, const BIGNUM **ps) 
 #include "contrib/lax_der_parsing.c"
 #include "contrib/lax_der_privatekey_parsing.c"
 
-#if !defined(VG_CHECK)
-# if defined(VALGRIND)
-#  include <valgrind/memcheck.h>
-#  define VG_UNDEF(x,y) VALGRIND_MAKE_MEM_UNDEFINED((x),(y))
-#  define VG_CHECK(x,y) VALGRIND_CHECK_MEM_IS_DEFINED((x),(y))
-# else
-#  define VG_UNDEF(x,y)
-#  define VG_CHECK(x,y)
-# endif
-#endif
-
 static int count = 64;
 static secp256k1_context *ctx = NULL;
 
@@ -193,8 +182,10 @@ void run_context_tests(int use_prealloc) {
     ecount2 = 10;
     secp256k1_context_set_illegal_callback(vrfy, counting_illegal_callback_fn, &ecount);
     secp256k1_context_set_illegal_callback(sign, counting_illegal_callback_fn, &ecount2);
-    secp256k1_context_set_error_callback(sign, counting_illegal_callback_fn, NULL);
-    CHECK(vrfy->error_callback.fn != sign->error_callback.fn);
+    /* set error callback (to a function that still aborts in case malloc() fails in secp256k1_context_clone() below) */
+    secp256k1_context_set_error_callback(sign, secp256k1_default_illegal_callback_fn, NULL);
+    CHECK(sign->error_callback.fn != vrfy->error_callback.fn);
+    CHECK(sign->error_callback.fn == secp256k1_default_illegal_callback_fn);
 
     /* check if sizes for cloning are consistent */
     CHECK(secp256k1_context_preallocated_clone_size(none) == secp256k1_context_preallocated_size(SECP256K1_CONTEXT_NONE));
@@ -250,7 +241,8 @@ void run_context_tests(int use_prealloc) {
     }
 
     /* Verify that the error callback makes it across the clone. */
-    CHECK(vrfy->error_callback.fn != sign->error_callback.fn);
+    CHECK(sign->error_callback.fn != vrfy->error_callback.fn);
+    CHECK(sign->error_callback.fn == secp256k1_default_illegal_callback_fn);
     /* And that it resets back to default. */
     secp256k1_context_set_error_callback(sign, NULL, NULL);
     CHECK(vrfy->error_callback.fn == sign->error_callback.fn);
@@ -2226,6 +2218,9 @@ void test_ge(void) {
                 /* Normal doubling. */
                 secp256k1_gej_double_var(&resj, &gej[i2], NULL);
                 ge_equals_gej(&ref, &resj);
+                /* Constant-time doubling. */
+                secp256k1_gej_double(&resj, &gej[i2]);
+                ge_equals_gej(&ref, &resj);
             }
 
             /* Test adding opposites. */
@@ -2978,14 +2973,16 @@ void test_ecmult_multi(secp256k1_scratch *scratch, secp256k1_ecmult_multi_func e
 
 void test_ecmult_multi_batch_single(secp256k1_ecmult_multi_func ecmult_multi) {
     secp256k1_scalar szero;
-    secp256k1_scalar sc[32];
-    secp256k1_ge pt[32];
+    secp256k1_scalar sc;
+    secp256k1_ge pt;
     secp256k1_gej r;
     ecmult_multi_data data;
     secp256k1_scratch *scratch_empty;
 
-    data.sc = sc;
-    data.pt = pt;
+    random_group_element_test(&pt);
+    random_scalar_order(&sc);
+    data.sc = &sc;
+    data.pt = &pt;
     secp256k1_scalar_set_int(&szero, 0);
 
     /* Try to multiply 1 point, but scratch space is empty.*/
@@ -3129,7 +3126,7 @@ void test_ecmult_multi_batching(void) {
     data.pt = pt;
     secp256k1_gej_neg(&r2, &r2);
 
-    /* Test with empty scratch space. It should compute the correct result using 
+    /* Test with empty scratch space. It should compute the correct result using
      * ecmult_mult_simple algorithm which doesn't require a scratch space. */
     scratch = secp256k1_scratch_create(&ctx->error_callback, 0);
     CHECK(secp256k1_ecmult_multi_var(&ctx->error_callback, &ctx->ecmult_ctx, scratch, &r, &scG, ecmult_multi_callback, &data, n_points));
@@ -3243,6 +3240,7 @@ void test_constant_wnaf(const secp256k1_scalar *number, int w) {
     int skew;
     int bits = 256;
     secp256k1_scalar num = *number;
+    secp256k1_scalar scalar_skew;
 
     secp256k1_scalar_set_int(&x, 0);
     secp256k1_scalar_set_int(&shift, 1 << w);
@@ -3273,7 +3271,8 @@ void test_constant_wnaf(const secp256k1_scalar *number, int w) {
         secp256k1_scalar_add(&x, &x, &t);
     }
     /* Skew num because when encoding numbers as odd we use an offset */
-    secp256k1_scalar_cadd_bit(&num, skew == 2, 1);
+    secp256k1_scalar_set_int(&scalar_skew, 1 << (skew == 2));
+    secp256k1_scalar_add(&num, &num, &scalar_skew);
     CHECK(secp256k1_scalar_eq(&x, &num));
 }
 
@@ -3385,13 +3384,32 @@ void run_wnaf(void) {
     int i;
     secp256k1_scalar n = {{0}};
 
+    test_constant_wnaf(&n, 4);
     /* Sanity check: 1 and 2 are the smallest odd and even numbers and should
      *               have easier-to-diagnose failure modes  */
     n.d[0] = 1;
     test_constant_wnaf(&n, 4);
     n.d[0] = 2;
     test_constant_wnaf(&n, 4);
-    /* Test 0 */
+    /* Test -1, because it's a special case in wnaf_const */
+    n = secp256k1_scalar_one;
+    secp256k1_scalar_negate(&n, &n);
+    test_constant_wnaf(&n, 4);
+
+    /* Test -2, which may not lead to overflows in wnaf_const */
+    secp256k1_scalar_add(&n, &secp256k1_scalar_one, &secp256k1_scalar_one);
+    secp256k1_scalar_negate(&n, &n);
+    test_constant_wnaf(&n, 4);
+
+    /* Test (1/2) - 1 = 1/-2 and 1/2 = (1/-2) + 1
+       as corner cases of negation handling in wnaf_const */
+    secp256k1_scalar_inverse(&n, &n);
+    test_constant_wnaf(&n, 4);
+
+    secp256k1_scalar_add(&n, &n, &secp256k1_scalar_one);
+    test_constant_wnaf(&n, 4);
+
+    /* Test 0 for fixed wnaf */
     test_fixed_wnaf_small();
     /* Random tests */
     for (i = 0; i < count; i++) {
@@ -5303,6 +5321,161 @@ void run_memczero_test(void) {
     CHECK(memcmp(buf1, buf2, sizeof(buf1)) == 0);
 }
 
+void int_cmov_test(void) {
+    int r = INT_MAX;
+    int a = 0;
+
+    secp256k1_int_cmov(&r, &a, 0);
+    CHECK(r == INT_MAX);
+
+    r = 0; a = INT_MAX;
+    secp256k1_int_cmov(&r, &a, 1);
+    CHECK(r == INT_MAX);
+
+    a = 0;
+    secp256k1_int_cmov(&r, &a, 1);
+    CHECK(r == 0);
+
+    a = 1;
+    secp256k1_int_cmov(&r, &a, 1);
+    CHECK(r == 1);
+
+    r = 1; a = 0;
+    secp256k1_int_cmov(&r, &a, 0);
+    CHECK(r == 1);
+
+}
+
+void fe_cmov_test(void) {
+    static const secp256k1_fe zero = SECP256K1_FE_CONST(0, 0, 0, 0, 0, 0, 0, 0);
+    static const secp256k1_fe one = SECP256K1_FE_CONST(0, 0, 0, 0, 0, 0, 0, 1);
+    static const secp256k1_fe max = SECP256K1_FE_CONST(
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL,
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+    );
+    secp256k1_fe r = max;
+    secp256k1_fe a = zero;
+
+    secp256k1_fe_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    r = zero; a = max;
+    secp256k1_fe_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    a = zero;
+    secp256k1_fe_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &zero, sizeof(r)) == 0);
+
+    a = one;
+    secp256k1_fe_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+
+    r = one; a = zero;
+    secp256k1_fe_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+}
+
+void fe_storage_cmov_test(void) {
+    static const secp256k1_fe_storage zero = SECP256K1_FE_STORAGE_CONST(0, 0, 0, 0, 0, 0, 0, 0);
+    static const secp256k1_fe_storage one = SECP256K1_FE_STORAGE_CONST(0, 0, 0, 0, 0, 0, 0, 1);
+    static const secp256k1_fe_storage max = SECP256K1_FE_STORAGE_CONST(
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL,
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+    );
+    secp256k1_fe_storage r = max;
+    secp256k1_fe_storage a = zero;
+
+    secp256k1_fe_storage_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    r = zero; a = max;
+    secp256k1_fe_storage_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    a = zero;
+    secp256k1_fe_storage_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &zero, sizeof(r)) == 0);
+
+    a = one;
+    secp256k1_fe_storage_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+
+    r = one; a = zero;
+    secp256k1_fe_storage_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+}
+
+void scalar_cmov_test(void) {
+    static const secp256k1_scalar zero = SECP256K1_SCALAR_CONST(0, 0, 0, 0, 0, 0, 0, 0);
+    static const secp256k1_scalar one = SECP256K1_SCALAR_CONST(0, 0, 0, 0, 0, 0, 0, 1);
+    static const secp256k1_scalar max = SECP256K1_SCALAR_CONST(
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL,
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+    );
+    secp256k1_scalar r = max;
+    secp256k1_scalar a = zero;
+
+    secp256k1_scalar_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    r = zero; a = max;
+    secp256k1_scalar_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    a = zero;
+    secp256k1_scalar_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &zero, sizeof(r)) == 0);
+
+    a = one;
+    secp256k1_scalar_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+
+    r = one; a = zero;
+    secp256k1_scalar_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+}
+
+void ge_storage_cmov_test(void) {
+    static const secp256k1_ge_storage zero = SECP256K1_GE_STORAGE_CONST(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    static const secp256k1_ge_storage one = SECP256K1_GE_STORAGE_CONST(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1);
+    static const secp256k1_ge_storage max = SECP256K1_GE_STORAGE_CONST(
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL,
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL,
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL,
+        0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL
+    );
+    secp256k1_ge_storage r = max;
+    secp256k1_ge_storage a = zero;
+
+    secp256k1_ge_storage_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    r = zero; a = max;
+    secp256k1_ge_storage_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &max, sizeof(r)) == 0);
+
+    a = zero;
+    secp256k1_ge_storage_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &zero, sizeof(r)) == 0);
+
+    a = one;
+    secp256k1_ge_storage_cmov(&r, &a, 1);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+
+    r = one; a = zero;
+    secp256k1_ge_storage_cmov(&r, &a, 0);
+    CHECK(memcmp(&r, &one, sizeof(r)) == 0);
+}
+
+void run_cmov_tests(void) {
+    int_cmov_test();
+    fe_cmov_test();
+    fe_storage_cmov_test();
+    scalar_cmov_test();
+    ge_storage_cmov_test();
+}
+
 int main(int argc, char **argv) {
     unsigned char seed16[16] = {0};
     unsigned char run32[32] = {0};
@@ -5441,6 +5614,8 @@ int main(int argc, char **argv) {
 
     /* util tests */
     run_memczero_test();
+
+    run_cmov_tests();
 
     secp256k1_rand256(run32);
     printf("random run = %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n", run32[0], run32[1], run32[2], run32[3], run32[4], run32[5], run32[6], run32[7], run32[8], run32[9], run32[10], run32[11], run32[12], run32[13], run32[14], run32[15]);

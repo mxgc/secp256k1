@@ -69,6 +69,25 @@ static SECP256K1_INLINE void secp256k1_callback_call(const secp256k1_callback * 
 #define VERIFY_SETUP(stmt)
 #endif
 
+/* Define `VG_UNDEF` and `VG_CHECK` when VALGRIND is defined  */
+#if !defined(VG_CHECK)
+# if defined(VALGRIND)
+#  include <valgrind/memcheck.h>
+#  define VG_UNDEF(x,y) VALGRIND_MAKE_MEM_UNDEFINED((x),(y))
+#  define VG_CHECK(x,y) VALGRIND_CHECK_MEM_IS_DEFINED((x),(y))
+# else
+#  define VG_UNDEF(x,y)
+#  define VG_CHECK(x,y)
+# endif
+#endif
+
+/* Like `VG_CHECK` but on VERIFY only */
+#if defined(VERIFY)
+#define VG_CHECK_VERIFY(x,y) VG_CHECK((x), (y))
+#else
+#define VG_CHECK_VERIFY(x,y)
+#endif
+
 static SECP256K1_INLINE void *checked_malloc(const secp256k1_callback* cb, size_t size) {
     void *ret = malloc(size);
     if (ret == NULL) {
@@ -151,13 +170,10 @@ static SECP256K1_INLINE void *manual_alloc(void** prealloc_ptr, size_t alloc_siz
 # define I64uFORMAT "llu"
 #endif
 
-#if defined(HAVE___INT128)
-# if defined(__GNUC__)
-#  define SECP256K1_GNUC_EXT __extension__
-# else
-#  define SECP256K1_GNUC_EXT
-# endif
-SECP256K1_GNUC_EXT typedef unsigned __int128 uint128_t;
+#if defined(__GNUC__)
+# define SECP256K1_GNUC_EXT __extension__
+#else
+# define SECP256K1_GNUC_EXT
 #endif
 
 /* Zero memory if flag == 1. Flag must be 0 or 1. Constant time. */
@@ -174,5 +190,40 @@ static SECP256K1_INLINE void memczero(void *s, size_t len, int flag) {
         len--;
     }
 }
+
+/** If flag is true, set *r equal to *a; otherwise leave it. Constant-time.  Both *r and *a must be initialized and non-negative.*/
+static SECP256K1_INLINE void secp256k1_int_cmov(int *r, const int *a, int flag) {
+    unsigned int mask0, mask1, r_masked, a_masked;
+    /* Access flag with a volatile-qualified lvalue.
+       This prevents clang from figuring out (after inlining) that flag can
+       take only be 0 or 1, which leads to variable time code. */
+    volatile int vflag = flag;
+
+    /* Casting a negative int to unsigned and back to int is implementation defined behavior */
+    VERIFY_CHECK(*r >= 0 && *a >= 0);
+
+    mask0 = (unsigned int)vflag + ~0u;
+    mask1 = ~mask0;
+    r_masked = ((unsigned int)*r & mask0);
+    a_masked = ((unsigned int)*a & mask1);
+
+    *r = (int)(r_masked | a_masked);
+}
+
+/* If USE_FORCE_WIDEMUL_{INT128,INT64} is set, use that wide multiplication implementation.
+ * Otherwise use the presence of __SIZEOF_INT128__ to decide.
+ */
+#if defined(USE_FORCE_WIDEMUL_INT128)
+# define SECP256K1_WIDEMUL_INT128 1
+#elif defined(USE_FORCE_WIDEMUL_INT64)
+# define SECP256K1_WIDEMUL_INT64 1
+#elif defined(__SIZEOF_INT128__)
+# define SECP256K1_WIDEMUL_INT128 1
+#else
+# define SECP256K1_WIDEMUL_INT64 1
+#endif
+#if defined(SECP256K1_WIDEMUL_INT128)
+SECP256K1_GNUC_EXT typedef unsigned __int128 uint128_t;
+#endif
 
 #endif /* SECP256K1_UTIL_H */

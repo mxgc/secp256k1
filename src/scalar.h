@@ -8,6 +8,7 @@
 #define SECP256K1_SCALAR_H
 
 #include "num.h"
+#include "util.h"
 
 #if defined HAVE_CONFIG_H
 #include "libsecp256k1-config.h"
@@ -15,12 +16,12 @@
 
 #if defined(EXHAUSTIVE_TEST_ORDER)
 #include "scalar_low.h"
-#elif defined(USE_SCALAR_4X64)
+#elif defined(SECP256K1_WIDEMUL_INT128)
 #include "scalar_4x64.h"
-#elif defined(USE_SCALAR_8X32)
+#elif defined(SECP256K1_WIDEMUL_INT64)
 #include "scalar_8x32.h"
 #else
-#error "Please select scalar implementation"
+#error "Please select wide multiplication implementation"
 #endif
 
 /** Clear a scalar to prevent the leak of sensitive data. */
@@ -111,7 +112,7 @@ static void secp256k1_scalar_split_lambda(secp256k1_scalar *r1, secp256k1_scalar
 /** Multiply a and b (without taking the modulus!), divide by 2**shift, and round to the nearest integer. Shift must be at least 256. */
 static void secp256k1_scalar_mul_shift_var(secp256k1_scalar *r, const secp256k1_scalar *a, const secp256k1_scalar *b, unsigned int shift);
 
-/** If flag is true, set *r equal to *a; otherwise leave it. Constant-time. */
+/** If flag is true, set *r equal to *a; otherwise leave it. Constant-time.  Both *r and *a must be initialized.*/
 static void secp256k1_scalar_cmov(secp256k1_scalar *r, const secp256k1_scalar *a, int flag);
 
 #endif /* SECP256K1_SCALAR_H */
